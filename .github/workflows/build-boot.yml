@@ -1,7 +1,7 @@
 name: Make and Upload Boot Image
 
 on:
-  workflow_dispatch:
+  workflow_dispatch: # 仅手动触发
 
 jobs:
   build:
@@ -13,41 +13,66 @@ jobs:
     - name: Checkout Code
       uses: actions/checkout@v4
 
+    - name: Load Configuration from config.env
+      run: |
+        # 解析 config.env 文件
+        if [ -f config.env ]; then
+          while IFS='=' read -r key value; do
+            # 忽略注释和空行
+            [[ $key =~ ^#.* ]] || [ -z "$key" ] && continue
+            # 移除可能存在的空格
+            key=$(echo $key | xargs)
+            value=$(echo $value | xargs)
+            echo "$key=$value" >> $GITHUB_ENV
+          done < config.env
+        else
+          echo "错误: 找不到 config.env 文件"
+          exit 1
+        fi
+
     - name: Install Dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y python3 python3-pip git
+        sudo apt-get install -y python3 python3-pip git wget
         mkdir -p $GITHUB_WORKSPACE/kernel_workspace
+
+    - name: Download Files
+      run: |
+        cd $GITHUB_WORKSPACE/kernel_workspace
+        # 使用从 config.env 中加载的链接
+        echo "正在下载原始 Boot..."
+        wget -q -O boot-source.img "${{ env.BOOT_URL }}"
+        echo "正在下载新内核 Image..."
+        wget -q -O Image "${{ env.IMAGE_URL }}"
+        
+        if [ ! -s boot-source.img ] || [ ! -s Image ]; then
+            echo "错误: 下载的文件为空，请检查 config.env 中的链接是否失效或非直连"
+            exit 1
+        fi
 
     - name: Download mkbootimg tools
       run: |
         cd $GITHUB_WORKSPACE/kernel_workspace
-        # 克隆 Google 官方工具集
         git clone https://android.googlesource.com/platform/system/tools/mkbootimg tools -b master-kernel-build-2022 --depth=1
 
     - name: Prepare and Replace Kernel
       run: |
         cd $GITHUB_WORKSPACE/kernel_workspace
         
-        # 拷贝仓库根目录下的 Image 和 boot-source.img
-        cp $GITHUB_WORKSPACE/boot-source.img .
-        cp $GITHUB_WORKSPACE/Image .
-
-        # 1. 提取原始 boot.img 的打包参数
+        # 1. 提取打包参数
         FORMAT_MKBOOTING=$(python3 tools/unpack_bootimg.py --boot_img boot-source.img --format mkbootimg)
         echo "FORMAT_MKBOOTING=$FORMAT_MKBOOTING" >> $GITHUB_ENV
         
-        # 2. 解包到 out 目录
+        # 2. 解包
         python3 tools/unpack_bootimg.py --boot_img boot-source.img --out out
         
-        # 3. 强制替换：将你的 Image 文件覆盖掉解包出来的内核文件
-        # 在 Android 标准解包流程中，内核目标文件固定为 out/kernel
-        if [ -f Image ]; then
+        # 3. 强制替换内核
+        if [ -f out/kernel ]; then
             cp Image out/kernel
             echo "SUCCESS: Image 已替换到 out/kernel"
             echo "PROCESS_READY=true" >> $GITHUB_ENV
         else
-            echo "ERROR: 找不到 Image 文件"
+            echo "解包失败，未能在原镜像中找到内核组件"
             exit 1
         fi
 
@@ -55,7 +80,7 @@ jobs:
       if: env.PROCESS_READY == 'true'
       run: |
         cd $GITHUB_WORKSPACE/kernel_workspace
-        # 执行重新打包
+        # 重新合成
         python3 tools/mkbootimg.py ${{ env.FORMAT_MKBOOTING }} -o new-boot.img
         
         if [ -f new-boot.img ]; then
