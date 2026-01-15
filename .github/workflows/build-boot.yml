@@ -2,6 +2,9 @@ name: Make and Upload Boot Image
 
 on:
   workflow_dispatch:
+  push:
+    paths:
+      - 'config.env'  # 当你修改并推送 config.env 时也会自动触发
 
 jobs:
   build:
@@ -15,14 +18,12 @@ jobs:
 
     - name: Load Configuration
       run: |
-        if [ -f config.env ]; then
-          while IFS='=' read -r key value; do
-            [[ $key =~ ^#.* ]] || [ -z "$key" ] && continue
-            echo "$key=$(echo $value | xargs)" >> $GITHUB_ENV
-          done < config.env
-        else
-          echo "config.env missing" && exit 1
-        fi
+        # 读取 config.env 并写入到 GITHUB_ENV 供后续步骤使用
+        while IFS='=' read -r key value; do
+          if [[ ! $key =~ ^# && -n $key ]]; then
+            echo "$key=$value" >> $GITHUB_ENV
+          fi
+        done < config.env
 
     - name: Install Dependencies
       run: |
@@ -33,15 +34,14 @@ jobs:
     - name: Download Files
       run: |
         cd $GITHUB_WORKSPACE/kernel_workspace
-        # 使用 -P . 下载并保持原文件名
-        wget -q "${{ env.BOOT_URL }}"
-        wget -q "${{ env.IMAGE_URL }}"
+        # 使用从配置文件中读取的变量
+        wget -O boot-source.img "${{ env.BOOT_URL }}"
+        wget -O Image "${{ env.IMAGE_URL }}"
         
-        # 自动识别下载后的文件名
-        # 假设目录下只有两个下载的文件，一个是 boot 镜像，一个是内核
-        # 我们根据文件大小或关键字简单区分
-        echo "ORIGINAL_BOOT_FILE=$(basename "${{ env.BOOT_URL }}")" >> $GITHUB_ENV
-        echo "NEW_KERNEL_FILE=$(basename "${{ env.IMAGE_URL }}")" >> $GITHUB_ENV
+        if [ ! -s boot-source.img ] || [ ! -s Image ]; then
+            echo "错误: 下载失败，请检查 config.env 中的链接是否正确且为直连"
+            exit 1
+        fi
 
     - name: Download mkbootimg tools
       run: |
@@ -52,22 +52,20 @@ jobs:
       run: |
         cd $GITHUB_WORKSPACE/kernel_workspace
         
-        # 1. 提取参数（使用下载的原始文件名）
-        FORMAT_MKBOOTING=$(python3 tools/unpack_bootimg.py --boot_img "${{ env.ORIGINAL_BOOT_FILE }}" --format mkbootimg)
+        # 1. 提取打包参数
+        FORMAT_MKBOOTING=$(python3 tools/unpack_bootimg.py --boot_img boot-source.img --format mkbootimg)
         echo "FORMAT_MKBOOTING=$FORMAT_MKBOOTING" >> $GITHUB_ENV
         
         # 2. 解包
-        python3 tools/unpack_bootimg.py --boot_img "${{ env.ORIGINAL_BOOT_FILE }}" --out out
+        python3 tools/unpack_bootimg.py --boot_img boot-source.img --out out
         
-        # 3. 核心：自动对应替换
-        # 无论你下载的文件叫 Image, Image.gz 还是 kernel_new
-        # 只要它是从 IMAGE_URL 下载来的，我们就用它覆盖解包出来的内核组件
+        # 3. 替换内核
         if [ -f out/kernel ]; then
-            cp "${{ env.NEW_KERNEL_FILE }}" out/kernel
-            echo "已自动将 ${{ env.NEW_KERNEL_FILE }} 替换到内核位置"
+            cp Image out/kernel
             echo "PROCESS_READY=true" >> $GITHUB_ENV
         else
-          echo "解包异常" && exit 1
+            echo "解包失败，未找到内核文件"
+            exit 1
         fi
 
     - name: Make boot image
