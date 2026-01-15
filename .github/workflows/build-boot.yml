@@ -1,0 +1,70 @@
+name: Make and Upload Boot Image
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Package Boot Image
+    runs-on: ubuntu-22.04
+    if: github.event.repository.owner.id == github.event.sender.id
+
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Install Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y python3 python3-pip git
+        mkdir -p $GITHUB_WORKSPACE/kernel_workspace
+
+    - name: Download mkbootimg tools
+      run: |
+        cd $GITHUB_WORKSPACE/kernel_workspace
+        # 克隆 Google 官方工具集
+        git clone https://android.googlesource.com/platform/system/tools/mkbootimg tools -b master-kernel-build-2022 --depth=1
+
+    - name: Prepare and Replace Kernel
+      run: |
+        cd $GITHUB_WORKSPACE/kernel_workspace
+        
+        # 拷贝仓库根目录下的 Image 和 boot-source.img
+        cp $GITHUB_WORKSPACE/boot-source.img .
+        cp $GITHUB_WORKSPACE/Image .
+
+        # 1. 提取原始 boot.img 的打包参数
+        FORMAT_MKBOOTING=$(python3 tools/unpack_bootimg.py --boot_img boot-source.img --format mkbootimg)
+        echo "FORMAT_MKBOOTING=$FORMAT_MKBOOTING" >> $GITHUB_ENV
+        
+        # 2. 解包到 out 目录
+        python3 tools/unpack_bootimg.py --boot_img boot-source.img --out out
+        
+        # 3. 强制替换：将你的 Image 文件覆盖掉解包出来的内核文件
+        # 在 Android 标准解包流程中，内核目标文件固定为 out/kernel
+        if [ -f Image ]; then
+            cp Image out/kernel
+            echo "SUCCESS: Image 已替换到 out/kernel"
+            echo "PROCESS_READY=true" >> $GITHUB_ENV
+        else
+            echo "ERROR: 找不到 Image 文件"
+            exit 1
+        fi
+
+    - name: Make boot image
+      if: env.PROCESS_READY == 'true'
+      run: |
+        cd $GITHUB_WORKSPACE/kernel_workspace
+        # 执行重新打包
+        python3 tools/mkbootimg.py ${{ env.FORMAT_MKBOOTING }} -o new-boot.img
+        
+        if [ -f new-boot.img ]; then
+            echo "MAKE_BOOT_IMAGE_OK=true" >> $GITHUB_ENV
+        fi
+
+    - name: Upload boot image
+      if: env.MAKE_BOOT_IMAGE_OK == 'true'
+      uses: actions/upload-artifact@v4
+      with:
+        name: patched-boot-image
+        path: kernel_workspace/new-boot.img
