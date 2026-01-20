@@ -1,0 +1,117 @@
+name: newwww
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'config.env'
+
+jobs:
+  build:
+    name: Package Boot Image
+    runs-on: ubuntu-22.04
+    if: github.event.repository.owner.id == github.event.sender.id
+
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Load Configuration
+      run: |
+        while IFS='=' read -r key value; do
+          if [[ ! $key =~ ^# && -n $key ]]; then
+            echo "$key=$value" >> $GITHUB_ENV
+          fi
+        done < config.env
+
+    - name: Install Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y python3 python3-pip git wget zip
+        mkdir -p $GITHUB_WORKSPACE/kernel_workspace
+
+    - name: Download Files
+      run: |
+        cd $GITHUB_WORKSPACE/kernel_workspace
+        # 下载原始 boot 和内核 Image
+        wget -q -O boot-source.img "${{ env.BOOT_URL }}"
+        wget -q -O Image "${{ env.IMAGE_URL }}"
+        
+        if [ ! -s boot-source.img ] || [ ! -s Image ]; then
+            echo "错误: 下载失败，请检查链接"
+            exit 1
+        fi
+
+    - name: Download mkbootimg tools
+      run: |
+        cd $GITHUB_WORKSPACE/kernel_workspace
+        git clone https://android.googlesource.com/platform/system/tools/mkbootimg tools -b master-kernel-build-2022 --depth=1
+
+    - name: Prepare and Replace Kernel
+      run: |
+        cd $GITHUB_WORKSPACE/kernel_workspace
+        # 提取原厂参数
+        FORMAT_MKBOOTING=$(python3 tools/unpack_bootimg.py --boot_img boot-source.img --format mkbootimg)
+        echo "FORMAT_MKBOOTING=$FORMAT_MKBOOTING" >> $GITHUB_ENV
+        
+        # 解包到 out 目录
+        python3 tools/unpack_bootimg.py --boot_img boot-source.img --out out
+        
+        # --- 核心修改部分：导出原厂内核 ---
+        if [ -f out/kernel ]; then
+            # 将解包出的原厂内核复制到根目录并重命名，方便后续上传
+            cp out/kernel $GITHUB_WORKSPACE/kernel_workspace/original-kernel-from-boot
+            echo "已成功备份原厂内核"
+            
+            # 替换内核文件为你的新内核
+            cp Image out/kernel
+            echo "PROCESS_READY=true" >> $GITHUB_ENV
+        else
+            echo "解包失败"
+            exit 1
+        fi
+
+    - name: Make boot image
+      if: env.PROCESS_READY == 'true'
+      run: |
+        cd $GITHUB_WORKSPACE/kernel_workspace
+        # 合成新的 boot.img
+        python3 tools/mkbootimg.py ${{ env.FORMAT_MKBOOTING }} -o new-boot.img
+        if [ -f new-boot.img ]; then
+            echo "MAKE_BOOT_IMAGE_OK=true" >> $GITHUB_ENV
+        fi
+
+    - name: Make AnyKernel3 Zip
+      if: env.PROCESS_READY == 'true'
+      run: |
+        cd $GITHUB_WORKSPACE/kernel_workspace
+        # 克隆 AnyKernel3 模板
+        git clone https://github.com/osm0sis/AnyKernel3 --depth=1
+        
+        # 自动化配置 anykernel.sh
+        sed -i 's/do.devicecheck=1/do.devicecheck=0/g' AnyKernel3/anykernel.sh
+        sed -i 's!block=/dev/block/platform/omap/omap_hsmmc.0/by-name/boot;!block=auto;!g' AnyKernel3/anykernel.sh
+        sed -i 's/is_slot_device=0;/is_slot_device=auto;/g' AnyKernel3/anykernel.sh
+        
+        # 仅放入内核 Image (不要 dtbo)
+        cp Image AnyKernel3/
+        
+        # 清理无用文件并打包
+        cd AnyKernel3
+        rm -rf .git* README.md
+        zip -r ../AnyKernel3-Kernel-Update.zip *
+        cd ..
+        
+        if [ -f AnyKernel3-Kernel-Update.zip ]; then
+            echo "MAKE_AK3_OK=true" >> $GITHUB_ENV
+        fi
+
+    - name: Upload Results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: Kernel-Package-Result
+        path: |
+          kernel_workspace/new-boot.img
+          kernel_workspace/AnyKernel3-Kernel-Update.zip
+          kernel_workspace/original-kernel-from-boot
